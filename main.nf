@@ -4,9 +4,9 @@
 //include { MEGAHIT } from './modules/megahit.nf'
 
 include { POOL_ORFS } from './modules/pool_orfs.nf'
-include { MMSEQ } from './modules/mmseqs.nf'
-
-
+include { DEREPLICATION } from './modules/mmseqs.nf'
+include { HMMSEARCH } from './modules/hmmsearch_per_profile.nf'
+include { FILTER_PROTEINS } from './modules/filter_proteins.nf'
 
 //include { BOWTIE2 } from './modules/bowtie2.nf'
 //include { SAMTOOLS } from './modules/samtools.nf'
@@ -15,21 +15,15 @@ include { MMSEQ } from './modules/mmseqs.nf'
 params {
     input: Path                  // CSV with columns: sample,fastq_1,fastq_2
     batch: String = 'batch01'    // name of the batch for MMSEQ dereplication
-    hmm_db: Path                 // path to HMM database for HMMSEARCH
-    hmm_folder: Path             // path to folder for HMMSEARCH output
-    hmm_evlue: Float = 1e-5      // e-value threshold for HMMSEARCH, can be overwirtten via command line or yaml config
+    pooled_faa: Path = null      // path to pooled ORFs (optional, if not provided, will pool from input CSV)
+    hmm_db: Path = 'assets/hmm_db'                // path to HMM database for HMMSEARCH
+    hmm_evalue: Float = 1e-5      // e-value threshold for HMMSEARCH, can be overwirtten via command line or yaml config
 }
 
 workflow {
     main:
-    //execute FASTP process to trim reads
-    //FASTP(ch_reads)
-    // ch_reads = channel
-    //     .fromPath(params.input)
-    //     .splitCsv(header: true)
-    //     .map { row ->
-    //         [ row.sample, file(row.fastq_1, checkIfExists: true), file(row.fastq_2, checkIfExists: true) ]
-    //     }.view()
+   
+    // ## execute POOL_ORFS process to pool ORFs from multiple samples into a single FASTA file
     if( params.pooled_faa ) {
         // Already pooled orfs, so start from MMSEQ with the file you provide
         ch_pooled = channel.value( file(params.pooled_faa, checkIfExists: true) )
@@ -46,27 +40,45 @@ workflow {
         POOL_ORFS(ch_gathered)
         ch_pooled = POOL_ORFS.out.faa
     }
-    // execute HMM-search process on the pooled ORFs
-    HMMSEARCH(ch_pooled, params.hmm_db, params.hmm_folder, params.hmm_evlue)
-    // execute MMSEQ process to dereplicate sequences
-    MMSEQ(ch_pooled, params.batch)
 
-    //execute  GATHER_PRODIGAL process to gather prodigal results
-    POOL_ORFS(ch_gathered)
-    // execute HMM-search process on the pooled ORFs
-    HMMSEARCH(POOL_ORFS.out.faa, params.hmm_db, params.hmm_folder, params.hmm_evlue)
-    // execute MMSEQ process to dereplicate sequences
-    MMSEQ(POOL_ORFS.out.faa, params.batch)
+    // ## execute HMM-search process on the pooled ORFs
+    if( params.hmm_db ) {
+
+        hmm_db = file(params.hmm_db, checkIfExists: true)
+        profiles = files("${params.hmm_db}/*.hmm")
+        
+        if( !profiles ) {
+            error "No .hmm profiles found in: ${params.hmm_db}"
+        }
+        ch_proteins = ch_pooled
+        ch_profiles = channel.fromList(profiles)
+
+        HMMSEARCH(ch_profiles, ch_proteins, params.hmm_evalue)
+    }
+
+    ch_all_hits = HMMSEARCH.out.tblout
+        .map { name, tbl -> tbl }
+        .collectFile(name: 'all_profiles.tblout', sort: true)
+    
+    // ## execute FILTER_PROTEINS process to filter the pooled ORFs based on HMMSEARCH results
+    //FILTER_PROTEINS(ch_pooled, ch_all_hits)
+    // ## execute MMSEQ process to dereplicate sequences
+    DEREPLICATION(ch_pooled, params.batch)
+    
 
     publish:
     //trimmed = FASTP.out.reads
     //reports = FASTP.out.reports
     collected_orfs = ch_pooled
-    hmm_table = HMMSEARCH.out.hmm_table
-    clusters = MMSEQ.out.clusters
-    rep_seqs = MMSEQ.out.rep_seqs
-    all_seqs = MMSEQ.out.all_seqs
-    kept_ids = MMSEQ.out.kept_ids
+    // HMM selection
+    hmm_table = HMMSEARCH.out.tblout
+    domtblout = HMMSEARCH.out.domtblout
+    out = HMMSEARCH.out.out
+    // dereplication_output
+    clusters = DEREPLICATION.out.clusters
+    rep_seqs = DEREPLICATION.out.rep_seqs
+    all_seqs = DEREPLICATION.out.all_seqs
+    kept_ids = DEREPLICATION.out.kept_ids
 }
 
 output {
@@ -75,6 +87,8 @@ output {
     collected_orfs { path "pooled_orfs/" ; mode 'copy' }
     // HMM selection
     hmm_table     { path "hmmsearch/" ; mode 'copy' }
+    domtblout     { path "hmmsearch/" ; mode 'copy' }
+    out           { path "hmmsearch/" ; mode 'copy' }
     // dereplication_output
     clusters       { path "gene_catalog/${params.batch}" ; mode 'copy' } 
     rep_seqs       { path "gene_catalog/${params.batch}" ; mode 'copy' } 
