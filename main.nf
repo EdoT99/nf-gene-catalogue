@@ -4,6 +4,7 @@
 //include { MEGAHIT } from './modules/megahit.nf'
 
 include { POOL_ORFS } from './modules/pool_orfs.nf'
+include { POOL_ASSEMBLIES } from './modules/pool_assemblies.nf'
 include { DEREPLICATION } from './modules/mmseqs.nf'
 include { HMMSEARCH } from './modules/hmmsearch_per_profile.nf'
 include { FILTER_PROTEINS } from './modules/filter_proteins.nf'
@@ -15,7 +16,8 @@ include { FILTER_PROTEINS } from './modules/filter_proteins.nf'
 params {
     input: Path                  // CSV with columns: sample,fastq_1,fastq_2
     batch: String = 'batch01'    // name of the batch for MMSEQ dereplication
-    pooled_faa: Path = null      // path to pooled ORFs (optional, if not provided, will pool from input CSV)
+    pooled_faa: Path? = null      // path to pooled ORFs (optional, if not provided, will pool from input CSV)
+    pooled_contigs: Path? = null  // path to pooled assemblies (optional, if not provided, will pool from input CSV)
     hmm_db: Path = 'assets/hmm_db'                // path to HMM database for HMMSEARCH
     hmm_evalue: Float = 1e-5      // e-value threshold for HMMSEARCH, can be overwirtten via command line or yaml config
 }
@@ -23,24 +25,37 @@ params {
 workflow {
     main:
    
-    // ## execute POOL_ORFS process to pool ORFs from multiple samples into a single FASTA file
+    ch_rows = channel
+        .fromPath(params.input)
+        .splitCsv(header: true)
+
+    // pooling ORFs
     if( params.pooled_faa ) {
-        // Already pooled orfs, so start from MMSEQ with the file you provide
-        ch_pooled = channel.value( file(params.pooled_faa, checkIfExists: true) )
+        ch_pooled_orfs = channel.value( file(params.pooled_faa, checkIfExists: true) )
     }
     else {
-        // gather prodigal results from the CSV file
-        ch_gathered = channel
-            .fromPath(params.input)
-            .splitCsv(header: true)
+        ch_gathered_orfs = ch_rows
             .map { row -> [ row.sample, file(row.orfs, checkIfExists: true) ] }
             .toSortedList { a, b -> a[0] <=> b[0] }
             .map { pairs -> [ pairs.collect { it[0] }, pairs.collect { it[1] } ] }
-
-        POOL_ORFS(ch_gathered)
-        ch_pooled = POOL_ORFS.out.faa
+        
+        POOL_ORFS(ch_gathered_orfs)
+        ch_pooled_orfs = POOL_ORFS.out.faa
     }
-
+    // pooling assemblies
+    if(params.pooled_contigs) {
+        ch_pooled_assemblies = channel.value( file(params.pooled_contigs, checkIfExists: true) )
+    }
+    else {
+        ch_gathered_assemblies = ch_rows
+            .map { row -> [ row.sample, file(row.contigs, checkIfExists: true) ] }
+            .toSortedList { a, b -> a[0] <=> b[0] }
+            .map { pairs -> [ pairs.collect { it[0] }, pairs.collect { it[1] } ] }
+        
+        POOL_ASSEMBLIES(ch_gathered_assemblies)
+        ch_pooled_assemblies = POOL_ASSEMBLIES.out.fna
+    }
+    
     // ## execute HMM-search process on the pooled ORFs
     if( params.hmm_db ) {
 
@@ -50,7 +65,7 @@ workflow {
         if( !profiles ) {
             error "No .hmm profiles found in: ${params.hmm_db}"
         }
-        ch_proteins = ch_pooled
+        ch_proteins = ch_pooled_orfs
         ch_profiles = channel.fromList(profiles)
 
         HMMSEARCH(ch_profiles, ch_proteins, params.hmm_evalue)
@@ -63,17 +78,19 @@ workflow {
     // ## execute FILTER_PROTEINS process to filter the pooled ORFs based on HMMSEARCH results
     //FILTER_PROTEINS(ch_pooled, ch_all_hits)
     // ## execute MMSEQ process to dereplicate sequences
-    DEREPLICATION(ch_pooled, params.batch)
+    DEREPLICATION(ch_proteins, params.batch)
     
 
     publish:
     //trimmed = FASTP.out.reads
     //reports = FASTP.out.reports
-    collected_orfs = ch_pooled
+    collected_orfs = ch_pooled_orfs
+    collected_contigs = ch_pooled_assemblies
     // HMM selection
     hmm_table = HMMSEARCH.out.tblout
     domtblout = HMMSEARCH.out.domtblout
     out = HMMSEARCH.out.out
+    // filter contigs & proteins
     // dereplication_output
     clusters = DEREPLICATION.out.clusters
     rep_seqs = DEREPLICATION.out.rep_seqs
@@ -85,6 +102,8 @@ output {
     //trimmed      { path { sample, r1, r2 -> "fastp/${sample}" } }
     //reports      { path { sample, json, html -> "fastp/${sample}" } }
     collected_orfs { path "pooled_orfs/" ; mode 'copy' }
+    collected_contigs { path "pooled_contigs/" ; mode 'copy' }
+
     // HMM selection
     hmm_table     { path "hmmsearch/" ; mode 'copy' }
     domtblout     { path "hmmsearch/" ; mode 'copy' }
