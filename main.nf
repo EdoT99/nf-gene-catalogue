@@ -7,7 +7,7 @@ include { POOL_ORFS } from './modules/pool_orfs.nf'
 include { POOL_ASSEMBLIES } from './modules/pool_assemblies.nf'
 include { DEREPLICATION } from './modules/mmseqs.nf'
 include { HMMSEARCH } from './modules/hmmsearch_per_profile.nf'
-include { FILTER_PROTEINS } from './modules/filter_proteins.nf'
+//include { FILTER_PROTEINS } from './modules/filter_proteins.nf'
 
 //include { BOWTIE2 } from './modules/bowtie2.nf'
 //include { SAMTOOLS } from './modules/samtools.nf'
