@@ -3,3 +3,5 @@ results/
 .nextflow/
 .nextflow.log*
 null/
+!assets/*.csv
+assets/hmm_db/*
