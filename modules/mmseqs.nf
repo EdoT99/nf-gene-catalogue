@@ -1,4 +1,4 @@
-process MMSEQ {
+process DEREPLICATION {
 
     tag "${batch}"
 
