@@ -1,7 +1,9 @@
 #!/usr/bin/env nextflow
 
-//include { FASTP } from './modules/fastp.nf'
-//include { MEGAHIT } from './modules/megahit.nf'
+include { PREPROCESSING } from './subworkflows/preprocessing.nf'
+include { ASSEMBLY } from './subworkflows/assembly.nf'
+
+include { ORF_PREDICTION } from './subworkflows/orf_prediction.nf'
 
 include { POOL_ORFS } from './modules/pool_orfs.nf'
 include { POOL_ASSEMBLIES } from './modules/pool_assemblies.nf'
@@ -14,22 +16,57 @@ include { HMMSEARCH } from './modules/hmmsearch_per_profile.nf'
 //include { COVERM } from './modules/coverm.nf'
 
 params {
-    input: Path                  // CSV with columns: sample,fastq_1,fastq_2
+    input_sample_table: Path                  // CSV with columns: sample,fastq_1,fastq_2
     batch: String = 'batch01'    // name of the batch for MMSEQ dereplication
+
+    preprocessing = 'fastp'
+    assembler = 'megahit'  // default assembler, can be overwritten via command line or yaml config
+    
+    input_orf_table: Path                  // CSV with columns: sample,contigs,orfs
     pooled_faa: Path? = null      // path to pooled ORFs (optional, if not provided, will pool from input CSV)
     pooled_contigs: Path? = null  // path to pooled assemblies (optional, if not provided, will pool from input CSV)
+    
     hmm_db: Path = 'assets/hmm_db'                // path to HMM database for HMMSEARCH
     hmm_evalue: Float = 1e-5      // e-value threshold for HMMSEARCH, can be overwirtten via command line or yaml config
 }
 
 workflow {
     main:
-   
-    ch_rows = channel
-        .fromPath(params.input)
+
+    // check the samplesheet header
+    required_cols = [ 'sample', 'r1', 'r2' ]
+
+    samplesheet = file(params.input_sample_table, checkIfExists: true)
+    header      = samplesheet.readLines()[0].split(',').collect { it.trim() }
+    missing     = required_cols - header
+
+    if( missing ) {
+        error "Samplesheet ${params.input_sample_table} is missing column(s): ${missing.join(', ')}. " +
+              "Found: ${header.join(', ')}. Expected: ${required_cols.join(', ')}."
+    }
+    // Get the forward and reverse reads from the samplesheet
+    ch_fastq_pairs = channel
+        .fromPath(params.input_sample_table)
         .splitCsv(header: true)
+        .map {row ->  [ row.sample,
+          file(row.r1, checkIfExists: true),
+          file(row.r2, checkIfExists: true) ]
+    }}
+
+    PREPROCESSING(ch_fastq_pairs)
+    ch_trimmed_reads = PREPROCESSING.out.trimmed_reads
+
+    // Perfomr assembly with the specified assembler (megahit or metaspades)
+    if( !(params.assembler in ['megahit', 'metaspades']) ) {
+        error "Wrong assembler specified: ${params.assembler}. Must be either 'megahit' or 'metaspades'."
+    }
+    ASSEMBLY(ch_trimmed_reads, params.assembler)
 
     // pooling ORFs
+    ch_rows = channel
+        .fromPath(params.input_orf_table)
+        .splitCsv(header: true)
+
     if( params.pooled_faa ) {
         ch_pooled_orfs = channel.value( file(params.pooled_faa, checkIfExists: true) )
     }
@@ -82,8 +119,12 @@ workflow {
     
 
     publish:
-    //trimmed = FASTP.out.reads
-    //reports = FASTP.out.reports
+    trimmed = PREPROCESSING.out.reads
+    reports = PREPROCESSING.out.reports
+
+    contigs = ASSEMBLY.out.contigs
+    logs    = ASSEMBLY.out.logs
+
     collected_orfs = ch_pooled_orfs
     collected_contigs = ch_pooled_assemblies
     // HMM selection
@@ -99,8 +140,13 @@ workflow {
 }
 
 output {
-    //trimmed      { path { sample, r1, r2 -> "fastp/${sample}" } }
-    //reports      { path { sample, json, html -> "fastp/${sample}" } }
+    // preprocessing outputs
+    trimmed      { path { sample, tool, f -> "preprocessing/${tool}/${sample}" } ; mode 'copy' }
+    reports      { path { sample, tool, f -> "preprocessing/${tool}/${sample}" } ; mode 'copy' }
+    // assebly outputs
+    contigs      { path { sample, tool, f -> "assembly/${tool}/${sample}" } ; mode 'copy' }
+    logs         { path { sample, tool, f -> "assembly/${tool}/${sample}" } ; mode 'copy' }
+
     collected_orfs { path "pooled_orfs/" ; mode 'copy' }
     collected_contigs { path "pooled_contigs/" ; mode 'copy' }
 
