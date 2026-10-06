@@ -1,25 +1,30 @@
 process POOL_ORFS {
-    
     tag "${samples.size()} samples"
+    cpus 1
+    memory '2 GB'
 
     input:
-    // samples and faa_files are two lists in the SAME order.
-    // All inputs are named orf_predicted.faa, so each is staged in its own folder (input1/, input2/, ...).
-    // script prefix every header with the sample name: >k141_1_1 -> >SAMPLE_k141_1_1
-    tuple val(samples), path(faa_files, stageAs: 'input?/*')
+    // samples and files are two lists in the SAME order; each file is staged in its own folder
+    tuple val(samples), path(files, stageAs: 'input?/*')
 
     output:
-    path "pooled_orf_predicted.faa", emit: faa
+    path "pooled.fasta", emit: faa
 
     script:
     """
     samples=(${samples.join(' ')})
-    files=(${faa_files.join(' ')})
+    files=(${files.join(' ')})
 
-    : > pooled_orf_predicted.faa
+    : > pooled.fasta
     for i in "\${!files[@]}"; do
+        # >contig_12_3 -> >SAMPLE_contig_12_3
         awk -v s="\${samples[\$i]}" '/^>/{sub(/^>/, ">" s "_"); print; next} {print}' "\${files[\$i]}" \\
-            >> pooled_orf_predicted.faa
+            >> pooled.fasta
     done
+    """
+
+    stub:
+    """
+    touch pooled.fasta
     """
 }

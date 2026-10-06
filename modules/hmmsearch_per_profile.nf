@@ -7,9 +7,10 @@ process HMMSEARCH {
     container 'quay.io/biocontainers/hmmer:3.4--hdbdd923_1'
 
     input:
-    path(profile)           // ONE .hmm profile per task
-    path(proteins)          // protein FASTA (same file for every task)
-    val(evalue)             // e-value threshold, e.g. 1e-5
+    //path(profile)           // ONE .hmm profile per task
+    //path(proteins)          // protein FASTA (same file for every task)
+    //val(evalue)             // e-value threshold, e.g. 1e-5
+    tuple val(sample), path(sample_proteins), path(profile) val(evalue)       // trimmed paired-end reads
 
     output:
     tuple val(profile.baseName), path("${profile.baseName}.tblout"),    emit: tblout
@@ -29,6 +30,6 @@ process HMMSEARCH {
         -o ${prefix}.out \\
         ${args} \\
         ${profile} \\
-        ${proteins}
+        ${sample_proteins}
     """
 }
