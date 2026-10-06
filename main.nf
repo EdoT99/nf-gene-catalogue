@@ -11,14 +11,14 @@ include { POOL_ORFS as POOL_HITS   } from './modules/pool_orfs.nf'        // sam
 include { POOL_ORFS as POOL_GENES  } from './modules/pool_orfs.nf'
 include { DEREPLICATION            } from './modules/mmseqs.nf'
 include { EXTRACT_REP_GENES        } from './modules/extract_rep_genes.nf'  // catalogue genes (nucleotide)
-include { BOWTIE2_BUILD            } from './modules/bowtie2_build.nf'      // one index, built once
-include { BOWTIE2_ALIGN            } from './modules/bowtie2_align.nf'      // per sample -> sorted BAM
-include { COVERM_CONTIG            } from './modules/coverm_contig.nf'      // all BAMs -> abundance table
+include { ABUNDANCE                } from './subworkflows/abundance.nf'     // Bowtie2 index + mapping + CoverM
 
 params {
-    // ---- inputs: at least one; both can be combined ----
+    // ---- inputs ----
     input_sample_table: Path?   = null      // CSV: sample,r1,r2         reads (assembly and/or abundance)
     input_orf_table:    Path?   = null      // CSV: sample,orfs,contigs  existing Prodigal output (skips assembly)
+    reference:          Path?   = null      // existing nucleotide catalogue (rep_genes.fna):
+                                            //   ONLY the abundance step runs (needs --input_sample_table)
 
     preprocessing:      String  = 'fastp'   // 'fastp' or 'none' (reads already trimmed)
     assembler:          String  = 'megahit' // 'megahit' or 'metaspades'
@@ -31,6 +31,9 @@ params {
     min_bitscore:       Float   = 30        // bit-score cutoff in FILTER_HITS (comparable across samples)
 
     batch:              String  = 'batch01'
+
+    // ---- abundance ----
+    skip_abundance:     Boolean = false     // stop after the dereplicated catalogue (no mapping, no CoverM)
 }
 
 workflow {
@@ -41,8 +44,17 @@ workflow {
     // =========================================================================
     problems = []
 
-    if( !params.input_sample_table && !params.input_orf_table ) {
-        problems << "Provide --input_sample_table (reads) and/or --input_orf_table (Prodigal output)."
+    if( params.reference ) {
+        // abundance-only mode
+        if( !params.input_sample_table ) {
+            problems << "--reference needs --input_sample_table: the reads to map against the reference."
+        }
+        if( params.skip_abundance ) {
+            problems << "--reference and --skip_abundance together would run nothing. Remove one of them."
+        }
+    }
+    else if( !params.input_sample_table && !params.input_orf_table ) {
+        problems << "Provide --input_sample_table (reads) and/or --input_orf_table (Prodigal output), or --reference."
     }
 
     // [ value, parameter name, required columns ]
@@ -70,15 +82,26 @@ workflow {
     if( !(params.preprocessing in ['fastp', 'none']) ) {
         problems << "--preprocessing: '${params.preprocessing}' is not valid. Must be 'fastp' or 'none'."
     }
-    if( !(params.assembler in ['megahit', 'metaspades']) ) {
-        problems << "--assembler: '${params.assembler}' is not valid. Must be 'megahit' or 'metaspades'."
-    }
-    if( !files("${params.hmm_db}/*.hmm") ) {
-        problems << "--hmm_db: no .hmm profiles found in ${params.hmm_db}"
+    if( !params.reference ) {
+        // only needed when the catalogue is built
+        if( !(params.assembler in ['megahit', 'metaspades']) ) {
+            problems << "--assembler: '${params.assembler}' is not valid. Must be 'megahit' or 'metaspades'."
+        }
+        if( !files("${params.hmm_db}/*.hmm") ) {
+            problems << "--hmm_db: no .hmm profiles found in ${params.hmm_db}"
+        }
     }
 
     if( problems ) {
         error "Found ${problems.size()} problem(s) with the input:\n  - " + problems.join('\n  - ')
+    }
+
+    if( params.reference && params.input_orf_table ) {
+        log.warn "--reference is set: --input_orf_table is ignored (annotation and dereplication are skipped)."
+    }
+    if( !params.reference && params.skip_abundance && params.input_orf_table && params.input_sample_table ) {
+        log.warn "--skip_abundance is set and --input_orf_table is given: the reads in " +
+                 "--input_sample_table will not be used."
     }
 
     // channels filled only on some routes start empty
@@ -88,10 +111,26 @@ workflow {
     ch_contigs_out    = channel.empty()
     ch_assembly_logs  = channel.empty()
     ch_contig_map     = channel.empty()
-    ch_samples        = channel.empty()
+
+    ch_hmm_tblout     = channel.empty()
+    ch_hmm_hits       = channel.empty()
+    ch_hit_proteins   = channel.empty()
+    ch_hit_genes      = channel.empty()
+    ch_hit_coords     = channel.empty()
+    ch_all_hits       = channel.empty()
+    ch_pooled_hits    = channel.empty()
+    ch_pooled_genes   = channel.empty()
+    ch_clusters       = channel.empty()
+    ch_rep_seqs       = channel.empty()
+    ch_all_seqs       = channel.empty()
+    ch_kept_ids       = channel.empty()
+    ch_rep_genes      = channel.empty()   // the catalogue genes: built (steps 1b-3) or given (--reference)
+
+    ch_map_logs       = channel.empty()
+    ch_abundance      = channel.empty()
 
     // =========================================================================
-    // 1a. Reads: trimmed whenever given (needed for assembly AND abundance)
+    // 1a. Reads: prepared whenever given (needed for assembly AND abundance)
     // =========================================================================
     if( params.input_sample_table ) {
         ch_fastq_pairs = channel
@@ -100,8 +139,7 @@ workflow {
             .map { row -> [ row.sample, file(row.r1, checkIfExists: true), file(row.r2, checkIfExists: true) ] }
 
         if( params.preprocessing == 'none' ) {
-            // reads are already trimmed: use them as they are
-            ch_trimmed_reads = ch_fastq_pairs
+            ch_trimmed_reads = ch_fastq_pairs                  // already trimmed: use as they are
         }
         else {
             PREPROCESSING(ch_fastq_pairs, params.preprocessing)
@@ -112,103 +150,97 @@ workflow {
     }
 
     // =========================================================================
-    // 1b. ONE per-sample channel: [ sample, orfs.faa, contigs.fa ]
-    //     from the ORF table if given, otherwise by assembling the reads
+    // Reference: either given (--reference) or built (steps 1b-3)
     // =========================================================================
-    if( params.input_orf_table ) {
-        ch_samples = channel
-            .fromPath(params.input_orf_table, checkIfExists: true)
-            .splitCsv(header: true)
-            .map { row -> [ row.sample, file(row.orfs, checkIfExists: true), file(row.contigs, checkIfExists: true) ] }
+    if( params.reference ) {
+        // ---- abundance-only mode: everything up to the catalogue is skipped ----
+        ch_rep_genes = channel.value( [ params.batch, file(params.reference, checkIfExists: true) ] )
     }
     else {
-        ASSEMBLY(ch_trimmed_reads, params.assembler)
-        ch_contigs_out   = ASSEMBLY.out.contigs                     // [ sample, tool, contigs ]  (for publishing)
-        ch_assembly_logs = ASSEMBLY.out.logs
-        ch_contig_map    = ASSEMBLY.out.mapping                     // [ sample, tool, mapping.tsv ]
+        // =====================================================================
+        // 1b. ONE per-sample channel: [ sample, orfs.faa, contigs.fa ]
+        // =====================================================================
+        if( params.input_orf_table ) {
+            ch_samples = channel
+                .fromPath(params.input_orf_table, checkIfExists: true)
+                .splitCsv(header: true)
+                .map { row -> [ row.sample, file(row.orfs, checkIfExists: true), file(row.contigs, checkIfExists: true) ] }
+        }
+        else {
+            ASSEMBLY(ch_trimmed_reads, params.assembler)
+            ch_contigs_out   = ASSEMBLY.out.contigs                 // [ sample, tool, contigs ]  (for publishing)
+            ch_assembly_logs = ASSEMBLY.out.logs
+            ch_contig_map    = ASSEMBLY.out.mapping                 // [ sample, tool, mapping.tsv ]
 
-        ch_contigs = ASSEMBLY.out.contigs.map { sample, tool, f -> [ sample, f ] }   // [ sample, contigs ]
+            ch_contigs = ASSEMBLY.out.contigs.map { sample, tool, f -> [ sample, f ] }   // [ sample, contigs ]
 
-        ORF_PREDICTION(ch_contigs)                                  // emits faa: [ sample, orfs.faa ]
+            ORF_PREDICTION(ch_contigs)                              // emits faa: [ sample, orfs.faa ]
+            ch_samples = ORF_PREDICTION.out.faa.join(ch_contigs)    // [ sample, orfs.faa, contigs.fa ]
+        }
 
-        // join by sample name -> [ sample, orfs.faa, contigs.fa ]
-        ch_samples = ORF_PREDICTION.out.faa.join(ch_contigs)
+        ch_orfs        = ch_samples.map { sample, faa, contigs -> [ sample, faa ] }       // [ sample, orfs.faa ]
+        ch_sample_ctgs = ch_samples.map { sample, faa, contigs -> [ sample, contigs ] }   // [ sample, contigs.fa ]
+
+        // =====================================================================
+        // 2. Per-sample HMM annotation (runs in parallel, one task per sample)
+        // =====================================================================
+        ch_hmm_db = channel.value( file(params.hmm_db, checkIfExists: true) )
+
+        // same database size for every sample -> comparable E-values
+        ch_hmm_z = params.hmm_z
+            ? channel.value(params.hmm_z)
+            : ch_orfs.map { sample, faa -> faa.countFasta() }.sum()  // total ORFs over all samples
+
+        HMMSEARCH(ch_orfs, ch_hmm_db, params.hmm_evalue, ch_hmm_z)   // tblout: [ sample, tblout ]
+
+        FILTER_HITS(ch_orfs.join(HMMSEARCH.out.tblout), params.filter_evalue, params.min_bitscore)
+
+        EXTRACT_GENES(FILTER_HITS.out.faa.join(ch_sample_ctgs))     // [ sample, hits.faa, contigs.fa ]
+
+        // =====================================================================
+        // 3. Gather all samples -> pool hits -> dereplicate
+        // =====================================================================
+        ch_gathered_hit_faa = FILTER_HITS.out.faa
+            .toSortedList { a, b -> a[0] <=> b[0] }
+            .map { pairs -> [ pairs.collect { it[0] }, pairs.collect { it[1] } ] }   // [ [names], [hits.faa] ]
+
+        ch_gathered_hit_fna = EXTRACT_GENES.out.fna
+            .toSortedList { a, b -> a[0] <=> b[0] }
+            .map { pairs -> [ pairs.collect { it[0] }, pairs.collect { it[1] } ] }   // [ [names], [hits.fna] ]
+
+        POOL_HITS(ch_gathered_hit_faa)       // headers become >SAMPLE_contig_12_3
+        POOL_GENES(ch_gathered_hit_fna)
+
+        DEREPLICATION(POOL_HITS.out.faa, params.batch)
+
+        // nucleotide sequences of the representatives = nucleotide catalogue (= mapping reference)
+        EXTRACT_REP_GENES(DEREPLICATION.out.kept_ids, POOL_GENES.out.faa)
+
+        // outputs for publishing
+        ch_hmm_tblout   = HMMSEARCH.out.tblout
+        ch_hmm_hits     = FILTER_HITS.out.hits
+        ch_hit_proteins = FILTER_HITS.out.faa
+        ch_hit_genes    = EXTRACT_GENES.out.fna
+        ch_hit_coords   = EXTRACT_GENES.out.coords
+        ch_all_hits     = FILTER_HITS.out.hits
+            .map { sample, tsv -> tsv }
+            .collectFile(name: 'all_samples_hmm_hits.tsv', keepHeader: true, sort: true)
+        ch_pooled_hits  = POOL_HITS.out.faa
+        ch_pooled_genes = POOL_GENES.out.faa
+        ch_clusters     = DEREPLICATION.out.clusters
+        ch_rep_seqs     = DEREPLICATION.out.rep_seqs
+        ch_all_seqs     = DEREPLICATION.out.all_seqs
+        ch_kept_ids     = DEREPLICATION.out.kept_ids
+        ch_rep_genes    = EXTRACT_REP_GENES.out.fna                  // [ batch, rep_genes.fna ]
     }
 
-    // split the per-sample channel into the shapes the next steps need
-    ch_orfs        = ch_samples.map { sample, faa, contigs -> [ sample, faa ] }       // [ sample, orfs.faa ]
-    ch_sample_ctgs = ch_samples.map { sample, faa, contigs -> [ sample, contigs ] }   // [ sample, contigs.fa ]
-
     // =========================================================================
-    // 2. Per-sample HMM annotation (runs in parallel, one task per sample)
+    // 4. Abundance: map every sample's reads to the reference (built or given)
     // =========================================================================
-    ch_hmm_db = channel.value( file(params.hmm_db, checkIfExists: true) )
-
-    // same database size for every sample -> comparable E-values
-    ch_hmm_z = params.hmm_z
-        ? channel.value(params.hmm_z)
-        : ch_orfs.map { sample, faa -> faa.countFasta() }.sum()      // total ORFs over all samples
-
-    HMMSEARCH(ch_orfs, ch_hmm_db, params.hmm_evalue, ch_hmm_z)       // tblout: [ sample, tblout ]
-
-    // pair each sample's proteins with its own hits table -> [ sample, orfs.faa, tblout ]
-    ch_filter_in = ch_orfs.join(HMMSEARCH.out.tblout)
-
-    FILTER_HITS(ch_filter_in, params.filter_evalue, params.min_bitscore)
-
-    // pair each sample's hits with its own contigs -> [ sample, hits.faa, contigs.fa ]
-    ch_extract_in = FILTER_HITS.out.faa.join(ch_sample_ctgs)
-
-    EXTRACT_GENES(ch_extract_in)
-
-    // =========================================================================
-    // 3. Gather all samples -> pool hits -> dereplicate
-    // =========================================================================
-    ch_gathered_hit_faa = FILTER_HITS.out.faa
-        .toSortedList { a, b -> a[0] <=> b[0] }
-        .map { pairs -> [ pairs.collect { it[0] }, pairs.collect { it[1] } ] }   // [ [names], [hits.faa] ]
-
-    ch_gathered_hit_fna = EXTRACT_GENES.out.fna
-        .toSortedList { a, b -> a[0] <=> b[0] }
-        .map { pairs -> [ pairs.collect { it[0] }, pairs.collect { it[1] } ] }   // [ [names], [hits.fna] ]
-
-    POOL_HITS(ch_gathered_hit_faa)       // headers become >SAMPLE_contig_12_3
-    POOL_GENES(ch_gathered_hit_fna)
-
-    DEREPLICATION(POOL_HITS.out.faa, params.batch)
-
-    // one combined hits table for all samples (keeps the header of the first file only)
-    ch_all_hits = FILTER_HITS.out.hits
-        .map { sample, tsv -> tsv }
-        .collectFile(name: 'all_samples_hmm_hits.tsv', keepHeader: true, sort: true)
-
-    // =========================================================================
-    // 4. Abundance of the catalogue genes in every sample (needs reads)
-    // =========================================================================
-    ch_rep_genes   = channel.empty()
-    ch_map_logs    = channel.empty()
-    ch_abundance   = channel.empty()
-
-    if( params.input_sample_table ) {
-
-        // nucleotide sequences of the MMseqs2 representatives = the shared reference
-        EXTRACT_REP_GENES(DEREPLICATION.out.kept_ids, POOL_GENES.out.faa)
-        ch_rep_genes = EXTRACT_REP_GENES.out.fna                       // [ batch, rep_genes.fna ]
-
-        // ONE index for all samples (single-value channel, reused by every mapping task)
-        BOWTIE2_BUILD(ch_rep_genes)                                    // [ batch, bowtie2_index/ ]
-
-        // map every sample's trimmed reads against the same index, in parallel
-        BOWTIE2_ALIGN(ch_trimmed_reads, BOWTIE2_BUILD.out.index)       // bam: [ sample, sample.bam ]
-        ch_map_logs = BOWTIE2_ALIGN.out.log
-
-        // gather all BAMs -> one CoverM run -> one table (genes x samples)
-        ch_all_bams = BOWTIE2_ALIGN.out.bam
-            .map { sample, bam -> bam }
-            .collect()
-
-        COVERM_CONTIG(ch_all_bams, params.batch)
-        ch_abundance = COVERM_CONTIG.out.table                         // [ batch, abundance.tsv ]
+    if( params.input_sample_table && !params.skip_abundance ) {
+        ABUNDANCE(ch_trimmed_reads, ch_rep_genes, params.batch)
+        ch_abundance = ABUNDANCE.out.table                             // [ batch, abundance.tsv ]
+        ch_map_logs  = ABUNDANCE.out.logs                              // [ sample, bowtie2.log ]
     }
 
     publish:
@@ -218,22 +250,22 @@ workflow {
     assembly_logs  = ch_assembly_logs
     contig_mapping = ch_contig_map
 
-    hmm_tblout     = HMMSEARCH.out.tblout
-    hmm_hits       = FILTER_HITS.out.hits
-    hit_proteins   = FILTER_HITS.out.faa
-    hit_genes      = EXTRACT_GENES.out.fna
-    hit_coords     = EXTRACT_GENES.out.coords
+    hmm_tblout     = ch_hmm_tblout
+    hmm_hits       = ch_hmm_hits
+    hit_proteins   = ch_hit_proteins
+    hit_genes      = ch_hit_genes
+    hit_coords     = ch_hit_coords
     all_hits       = ch_all_hits
 
-    pooled_hits    = POOL_HITS.out.faa
-    pooled_genes   = POOL_GENES.out.faa
+    pooled_hits    = ch_pooled_hits
+    pooled_genes   = ch_pooled_genes
 
-    clusters       = DEREPLICATION.out.clusters
-    rep_seqs       = DEREPLICATION.out.rep_seqs
-    all_seqs       = DEREPLICATION.out.all_seqs
-    kept_ids       = DEREPLICATION.out.kept_ids
+    clusters       = ch_clusters
+    rep_seqs       = ch_rep_seqs
+    all_seqs       = ch_all_seqs
+    kept_ids       = ch_kept_ids
+    rep_genes      = params.reference ? channel.empty() : ch_rep_genes   // don't re-publish a given reference
 
-    rep_genes      = ch_rep_genes
     mapping_logs   = ch_map_logs
     abundance      = ch_abundance
 }
@@ -264,6 +296,6 @@ output {
     rep_genes      { path "gene_catalog/${params.batch}" ; mode 'copy' }
 
     // abundance
-    mapping_logs   { path "abundance/mapping_logs" ; mode 'copy' }
-    abundance      { path "abundance" ; mode 'copy' }
+    mapping_logs   { path "abundance/${params.batch}/mapping_logs" ; mode 'copy' }
+    abundance      { path "abundance/${params.batch}" ; mode 'copy' }
 }
