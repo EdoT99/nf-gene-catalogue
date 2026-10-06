@@ -2,14 +2,14 @@
 
 A Nextflow pipeline that builds a **non-redundant gene catalogue of target enzymes** from metagenomic samples.
 
-Each sample is processed **independently and in parallel**: reads are trimmed and assembled, genes are predicted, and the proteins are screened against user-provided HMM profiles. Only the proteins that pass the scoring filters, together with their gene sequences, are then pooled across samples and dereplicated into a non-redundant catalogue.
+Each sample is processed **independently and in parallel**: reads are trimmed and assembled, genes are predicted, and the proteins are screened against user-provided HMM profiles. Only the proteins that pass the scoring filters, together with their gene sequences, are then pooled across samples and dereplicated into a non-redundant catalogue. Finally, the reads of every sample are mapped back to the catalogue genes to measure their abundance in each sample.
 
 If you already have assemblies and Prodigal predictions (e.g. from a previous Geomosaic run), you can skip the read-based steps and start directly from them.
 
 ## Workflow
 
 ```
- reads samplesheet (sample, r1, r2) Table A
+ reads samplesheet (sample, r1, r2)
         │
         ▼
  PREPROCESSING ──► fastp: adapter / quality trimming
@@ -20,7 +20,7 @@ If you already have assemblies and Prodigal predictions (e.g. from a previous Ge
         ▼
  ORF_PREDICTION ──► Prodigal (metagenomic mode)
         │
-        │   ◄── or start here with a protein/contig samplesheet (sample, orfs, contigs) Table B
+        │   ◄── or start here with a protein/contig samplesheet (sample, orfs, contigs)
         ▼
  HMMSEARCH ──► all HMM profiles, fixed database size (-Z) for comparable E-values
         │
@@ -29,13 +29,24 @@ If you already have assemblies and Prodigal predictions (e.g. from a previous Ge
         │
         ▼
  EXTRACT_GENES ──► nucleotide sequence of each hit, from the sample's own contigs
-        │
+        |
         ▼
  POOL_HITS / POOL_GENES ──► hits of all samples, IDs prefixed with the sample name
         │
         ▼
  DEREPLICATION ──► non-redundant gene catalogue (MMseqs2)
-
+        │
+        ▼
+ EXTRACT_REP_GENES ──► nucleotide sequences of the catalogue genes
+        │
+        ▼
+ BOWTIE2_BUILD ──► indexing the gene-catalogue reference
+        │
+        ▼
+ BOWTIE2_ALIGN ──► trimmed reads of each sample vs the same index (per sample, in parallel)
+        │
+        ▼
+ COVERM_CONTIG ──► abundance table: catalogue gene × sample
 ```
 
 | # | Step | Tool | Output | Runs |
@@ -49,8 +60,11 @@ If you already have assemblies and Prodigal predictions (e.g. from a previous Ge
 | 7 | Gene extraction | SeqKit | nucleotide sequences + coordinates of the hits | per sample |
 | 8 | Pooling | — | one protein and one gene file, IDs prefixed with the sample name | once |
 | 9 | Dereplication | MMseqs2 | non-redundant gene catalogue | once |
+| 10 | Reference building | SeqKit, Bowtie2 | catalogue genes (`.fna`) + one Bowtie2 index | once |
+| 11 | Read mapping | Bowtie2, samtools | sorted BAM | per sample |
+| 12 | Abundance | CoverM `contig` | gene × sample table (counts, coverage, TPM) | once |
 
-Starting from existing Prodigal output (entry point B) skips steps 1–4.
+Starting from existing Prodigal output (entry point B) skips steps 2–4. Steps 1 and 10–12 need reads, so they run whenever a reads samplesheet is given, including together with entry point B.
 
 ### Tools
 
@@ -62,6 +76,8 @@ Starting from existing Prodigal output (entry point B) skips steps 1–4.
 | Gene prediction | [Prodigal](https://github.com/hyattpd/Prodigal) |
 | Profile search | [HMMER](http://hmmer.org/) |
 | Clustering / dereplication | [MMseqs2](https://github.com/soedinglab/MMseqs2) |
+| Read mapping | [Bowtie2](https://github.com/BenLangmead/bowtie2), [samtools](https://github.com/samtools/samtools) |
+| Abundance | [CoverM](https://github.com/wwood/CoverM) |
 
 All tools are pulled automatically as containers (Docker / Singularity) or conda environments, one per step. You do not need to install them yourself.
 
@@ -98,7 +114,17 @@ nextflow run EdoT99/nf-gene-catalogue -r main -profile test,docker
 
 ## Input
 
-The pipeline has two entry points. Use **exactly one** of them; the pipeline stops if neither or both are given.
+The pipeline accepts two samplesheets. Give **at least one**; they can also be combined:
+
+| Given | What runs |
+|---|---|
+| reads only (`--input_sample_table`) | full pipeline: trimming, assembly, Prodigal, annotation, catalogue, abundance |
+| proteins/contigs only (`--input_orf_table`) | annotation and catalogue; no abundance (no reads to map) |
+| both | trimming, annotation of the existing proteins, catalogue, abundance; assembly and Prodigal are skipped |
+
+When both are given, sample names must be identical in the two samplesheets, as each sample's reads are mapped and reported under that name.
+
+All inputs are checked at launch (files exist, required columns present, valid `--assembler`, profiles found in `--hmm_db`), and every problem found is reported together in one message.
 
 ### A. From reads (`--input_sample_table`)
 
@@ -163,12 +189,28 @@ Each sample's proteins are filtered in three steps:
 
 > **Why a fixed database size (`--hmm_z`)?** An HMMER E-value depends on how many sequences were searched. Because each sample is searched separately, a larger sample would otherwise get larger E-values than a smaller one for the very same hit. The pipeline therefore gives every search the same database size (`hmmsearch -Z`): by default the total number of ORFs over all samples, so E-values behave as if all samples had been searched together. Bit scores do not depend on database size and are directly comparable between samples.
 
+## Abundance
+
+All samples are mapped against **the same reference**: the nucleotide sequences of the dereplicated catalogue genes. Every catalogue gene is therefore one row of the abundance table and every sample one column, so values are directly comparable between samples.
+
+`coverm contig` treats each catalogue gene as a contig and by default reports three values per gene and sample:
+
+| Method | Meaning | Typical use |
+|---|---|---|
+| `count` | reads mapped to the gene | statistics on raw counts (e.g. DESeq2) |
+| `trimmed_mean` | mean coverage, ignoring the most extreme positions | coverage comparable between genes of different length |
+| `tpm` | transcripts per million: normalised for gene length and sequencing depth | relative abundance across samples |
+
+Only reliable alignments are counted (`--min-read-percent-identity 95`, `--min-read-aligned-percent 50`). With a reference made only of target genes, reads from related non-target genes would otherwise be counted too. Coverage at the gene ends is corrected for, as read pairs only partly overlap short genes there.
+
+Mapping can be turned off with `--skip_abundance`.
+
 ## Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--input_sample_table` | – | Reads samplesheet (`sample,r1,r2`). Entry point A. |
-| `--input_orf_table` | – | Protein/contig samplesheet (`sample,orfs,contigs`). Entry point B. |
+| `--input_sample_table` | – | Reads samplesheet (`sample,r1,r2`). Entry point A; also enables abundance. |
+| `--input_orf_table` | – | Protein/contig samplesheet (`sample,orfs,contigs`). Entry point B; skips assembly and Prodigal. |
 | `--assembler` | `megahit` | `megahit` or `metaspades`. metaSPAdes needs considerably more memory. |
 | `--hmm_db` | `assets/hmm_db` | Folder with `.hmm` profiles. |
 | `--hmm_evalue` | `1e-5` | Loose reporting threshold inside `hmmsearch`. |
@@ -176,6 +218,8 @@ Each sample's proteins are filtered in three steps:
 | `--filter_evalue` | `1e-10` | E-value cutoff for keeping a hit. |
 | `--min_bitscore` | `30` | Bit-score cutoff for keeping a hit. |
 | `--batch` | `batch01` | Name used for the gene catalogue outputs. |
+| `--skip_abundance` | `false` | Skip read mapping and CoverM. |
+| `--save_mapping` | `true` | Copy the Bowtie2 index and BAM files to `results/mapping/`. |
 
 Parameters can be given on the command line or collected in a YAML file:
 
@@ -205,6 +249,8 @@ process {
     withName: 'MEGAHIT'               { ext.args = '--presets meta-sensitive' }
     withName: 'FILTER_RENAME_CONTIGS' { ext.args = '-m 1500' }          // minimum contig length (default 1000 bp)
     withName: 'DEREPLICATION'         { ext.args = '--min-seq-id 0.9 -c 0.8 --cov-mode 1' }
+    withName: 'BOWTIE2_ALIGN'         { ext.args = '--very-sensitive' }
+    withName: 'COVERM_CONTIG'         { ext.args = '-m count tpm --min-read-percent-identity 97 --min-read-aligned-percent 75' }
 }
 ```
 
@@ -228,6 +274,17 @@ nextflow run EdoT99/nf-gene-catalogue -r main -profile docker \
 ```bash
 nextflow run EdoT99/nf-gene-catalogue -r main -profile docker \
     --input_orf_table orf_samplesheet.csv \
+    --hmm_db /path/to/hmm_profiles
+```
+
+### Existing proteins + reads for abundance
+
+Skips assembly and Prodigal but still maps the reads to the catalogue:
+
+```bash
+nextflow run EdoT99/nf-gene-catalogue -r main -profile docker \
+    --input_orf_table orf_samplesheet.csv \
+    --input_sample_table samplesheet.csv \
     --hmm_db /path/to/hmm_profiles
 ```
 
@@ -314,14 +371,21 @@ results/
 ├── pooled_hits/
 │   ├── proteins/                              hit proteins of all samples, IDs SAMPLE_contig_N_M
 │   └── genes/                                 hit genes of all samples, same IDs
-└── gene_catalog/<batch>/
-    ├── <batch>_rep_seq.fasta                  non-redundant representative sequences
-    ├── <batch>_cluster.tsv                    representative ⇥ member mapping
-    ├── <batch>_all_seqs.fasta                 all sequences grouped by cluster
-    └── <batch>_kept_ids.txt                   IDs of the representatives
+├── gene_catalog/<batch>/
+│   ├── <batch>_rep_seq.fasta                  non-redundant representative sequences
+│   ├── <batch>_cluster.tsv                    representative ⇥ member mapping
+│   ├── <batch>_all_seqs.fasta                 all sequences grouped by cluster
+│   ├── <batch>_kept_ids.txt                   IDs of the representatives
+│   └── <batch>_rep_genes.fna                  nucleotide sequences of the representatives (mapping reference)
+├── mapping/                                   (only with --save_mapping, the default)
+│   ├── bowtie2_index/<batch>.*.bt2            Bowtie2 index of the catalogue genes
+│   ├── bams/<sample>.bam                      reads of each sample mapped to the catalogue, sorted
+│   └── logs/<sample>.bowtie2.log              alignment rate of each sample
+└── abundance/
+    └── <batch>_abundance.tsv                  catalogue gene × sample: count, trimmed_mean, TPM
 ```
 
-`preprocessing/` and `assembly/` are only produced when starting from reads (entry point A).
+`preprocessing/`, `mapping/` and `abundance/` are produced whenever reads are given; `assembly/` only when the pipeline assembles (reads without `--input_orf_table`). BAM files can be large: run with `--save_mapping false` to keep them (and the index) only in Nextflow's `work/` directory; the mapping logs are always saved.
 
 ## Citations
 
@@ -333,6 +397,9 @@ If you use this pipeline, please cite the tools it relies on:
 - **Prodigal**: Hyatt D, et al. *Prodigal: prokaryotic gene recognition and translation initiation site identification.* BMC Bioinformatics (2010).
 - **HMMER**: Eddy SR. *Accelerated profile HMM searches.* PLoS Computational Biology (2011).
 - **MMseqs2**: Steinegger M, Söding J. *MMseqs2 enables sensitive protein sequence searching for the analysis of massive data sets.* Nature Biotechnology (2017).
+- **Bowtie2**: Langmead B, Salzberg SL. *Fast gapped-read alignment with Bowtie 2.* Nature Methods (2012).
+- **SAMtools**: Danecek P, et al. *Twelve years of SAMtools and BCFtools.* GigaScience (2021).
+- **CoverM**: Woodcroft BJ, et al. CoverM, https://github.com/wwood/CoverM (see the repository for the current citation).
 - **SeqKit**: Shen W, et al. *SeqKit: a cross-platform and ultrafast toolkit for FASTA/Q file manipulation.* PLoS ONE (2016).
 - **Nextflow**: Di Tommaso P, et al. *Nextflow enables reproducible computational workflows.* Nature Biotechnology (2017).
 
