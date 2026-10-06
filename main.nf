@@ -16,11 +16,11 @@ include { BOWTIE2_ALIGN            } from './modules/bowtie2_align.nf'      // p
 include { COVERM_CONTIG            } from './modules/coverm_contig.nf'      // all BAMs -> abundance table
 
 params {
-    // ---- entry points: give ONE of the two ----
-    input_sample_table: Path?   = null      // CSV: sample,r1,r2               (start from reads)
-    input_orf_table:    Path?   = null      // CSV: sample,orfs,contigs        (start from Prodigal output)
+    // ---- inputs: at least one; both can be combined ----
+    input_sample_table: Path?   = null      // CSV: sample,r1,r2         reads (assembly and/or abundance)
+    input_orf_table:    Path?   = null      // CSV: sample,orfs,contigs  existing Prodigal output (skips assembly)
 
-    preprocessing:      String  = 'fastp'
+    preprocessing:      String  = 'fastp'   // 'fastp' or 'none' (reads already trimmed)
     assembler:          String  = 'megahit' // 'megahit' or 'metaspades'
 
     // ---- HMM annotation ----
@@ -31,81 +31,97 @@ params {
     min_bitscore:       Float   = 30        // bit-score cutoff in FILTER_HITS (comparable across samples)
 
     batch:              String  = 'batch01'
-
 }
 
 workflow {
     main:
 
     // =========================================================================
-    // 0. Parameter checks
+    // 0. Parameter checks: collect every problem, stop once
     // =========================================================================
-    // 
     problems = []
 
     if( !params.input_sample_table && !params.input_orf_table ) {
-        error "Provide --input_sample_table (reads) AND/or --input_orf_table (Prodigal output)."
+        problems << "Provide --input_sample_table (reads) and/or --input_orf_table (Prodigal output)."
     }
-    if( params.input_sample_table ) {
-        // ---- route A: from reads ----
-        required_cols = [ 'sample', 'r1', 'r2' ]
-        header  = file(params.input_sample_table, checkIfExists: true).readLines()[0].split(',').collect { it.trim() }
-        missing = required_cols - header
+
+    // [ value, parameter name, required columns ]
+    sheets = [
+        [ params.input_sample_table, '--input_sample_table', [ 'sample', 'r1', 'r2' ] ],
+        [ params.input_orf_table,    '--input_orf_table',    [ 'sample', 'orfs', 'contigs' ] ]
+    ]
+    sheets.each { sheet, name, required_cols ->
+        if( !sheet ) {
+            return
+        }
+        def sheet_file = file(sheet)
+        if( !sheet_file.exists() ) {
+            problems << "${name}: file not found: ${sheet}"
+            return
+        }
+        def header  = sheet_file.readLines()[0].split(',').collect { it.trim() }
+        def missing = required_cols - header
         if( missing ) {
-            problems << "Samplesheet ${params.input_sample_table} is missing column(s): ${missing.join(', ')}. " +
-                  "Found: ${header.join(', ')}. Expected: ${required_cols.join(', ')}."
+            problems << "${name}: ${sheet} is missing column(s): ${missing.join(', ')}. " +
+                        "Found: ${header.join(', ')}. Expected: ${required_cols.join(', ')}."
         }
     }
-    if( params.input_orf_table ) {
-        // ---- route B: from existing Prodigal output ----
-        required_cols = [ 'sample', 'orfs', 'contigs' ]
-        header  = file(params.input_orf_table, checkIfExists: true).readLines()[0].split(',').collect { it.trim() }
-        missing = required_cols - header
-        if( missing ) {
-            problems << "Samplesheet ${params.input_orf_table} is missing column(s): ${missing.join(', ')}. " +
-                  "Found: ${header.join(', ')}. Expected: ${required_cols.join(', ')}."
-        }
-    }
+
     if( !(params.preprocessing in ['fastp', 'none']) ) {
         problems << "--preprocessing: '${params.preprocessing}' is not valid. Must be 'fastp' or 'none'."
     }
     if( !(params.assembler in ['megahit', 'metaspades']) ) {
-        error "Wrong assembler specified: ${params.assembler}. Must be either 'megahit' or 'metaspades'."
+        problems << "--assembler: '${params.assembler}' is not valid. Must be 'megahit' or 'metaspades'."
     }
-    profiles = files("${params.hmm_db}/*.hmm")
-    if( !profiles ) {
-        error "No .hmm profiles found in: ${params.hmm_db}"
+    if( !files("${params.hmm_db}/*.hmm") ) {
+        problems << "--hmm_db: no .hmm profiles found in ${params.hmm_db}"
     }
+
     if( problems ) {
         error "Found ${problems.size()} problem(s) with the input:\n  - " + problems.join('\n  - ')
     }
 
-    ch_trimmed_reads = channel.empty()
-    ch_fastp_reports = channel.empty()
-    ch_contigs_out   = channel.empty()
-    ch_assembly_logs = channel.empty()
-    ch_contig_map    = channel.empty()
+    // channels filled only on some routes start empty
+    ch_trimmed_reads  = channel.empty()     // used for assembly and mapping
+    ch_trimmed_output = channel.empty()     // published only if fastp ran
+    ch_fastp_reports  = channel.empty()
+    ch_contigs_out    = channel.empty()
+    ch_assembly_logs  = channel.empty()
+    ch_contig_map     = channel.empty()
+    ch_samples        = channel.empty()
 
     // =========================================================================
-    // 1. ONE per-sample channel: [ sample, orfs.faa, contigs.fa ]
+    // 1a. Reads: trimmed whenever given (needed for assembly AND abundance)
     // =========================================================================
     if( params.input_sample_table ) {
-        // ---- route A: from reads ----
         ch_fastq_pairs = channel
             .fromPath(params.input_sample_table)
             .splitCsv(header: true)
             .map { row -> [ row.sample, file(row.r1, checkIfExists: true), file(row.r2, checkIfExists: true) ] }
-        
+
         if( params.preprocessing == 'none' ) {
             // reads are already trimmed: use them as they are
             ch_trimmed_reads = ch_fastq_pairs
         }
         else {
             PREPROCESSING(ch_fastq_pairs, params.preprocessing)
-            ch_trimmed_reads = PREPROCESSING.out.trimmed_reads
-            ch_fastp_reports = PREPROCESSING.out.reports
+            ch_trimmed_reads  = PREPROCESSING.out.trimmed_reads
+            ch_trimmed_output = PREPROCESSING.out.trimmed_reads
+            ch_fastp_reports  = PREPROCESSING.out.reports
         }
+    }
 
+    // =========================================================================
+    // 1b. ONE per-sample channel: [ sample, orfs.faa, contigs.fa ]
+    //     from the ORF table if given, otherwise by assembling the reads
+    // =========================================================================
+    if( params.input_orf_table ) {
+        ch_samples = channel
+            .fromPath(params.input_orf_table, checkIfExists: true)
+            .splitCsv(header: true)
+            .map { row -> [ row.sample, file(row.orfs, checkIfExists: true), file(row.contigs, checkIfExists: true) ] }
+    }
+    else {
         ASSEMBLY(ch_trimmed_reads, params.assembler)
         ch_contigs_out   = ASSEMBLY.out.contigs                     // [ sample, tool, contigs ]  (for publishing)
         ch_assembly_logs = ASSEMBLY.out.logs
@@ -113,17 +129,10 @@ workflow {
 
         ch_contigs = ASSEMBLY.out.contigs.map { sample, tool, f -> [ sample, f ] }   // [ sample, contigs ]
 
-        ORF_PREDICTION(ch_contigs)                                  // must emit faa: [ sample, orfs.faa ]
+        ORF_PREDICTION(ch_contigs)                                  // emits faa: [ sample, orfs.faa ]
 
-        // join by sample name → [ sample, orfs.faa, contigs.fa ]
+        // join by sample name -> [ sample, orfs.faa, contigs.fa ]
         ch_samples = ORF_PREDICTION.out.faa.join(ch_contigs)
-    }
-    else if( params.input_sample_table && params.input_orf_table) {
-        // ---- route B: from existing Prodigal output ----
-        ch_samples = channel
-            .fromPath(params.input_orf_table, checkIfExists: true)
-            .splitCsv(header: true)
-            .map { row -> [ row.sample, file(row.orfs, checkIfExists: true), file(row.contigs, checkIfExists: true) ] }
     }
 
     // split the per-sample channel into the shapes the next steps need
@@ -135,7 +144,7 @@ workflow {
     // =========================================================================
     ch_hmm_db = channel.value( file(params.hmm_db, checkIfExists: true) )
 
-    // same database size for every sample → comparable E-values
+    // same database size for every sample -> comparable E-values
     ch_hmm_z = params.hmm_z
         ? channel.value(params.hmm_z)
         : ch_orfs.map { sample, faa -> faa.countFasta() }.sum()      // total ORFs over all samples
@@ -146,15 +155,11 @@ workflow {
     ch_filter_in = ch_orfs.join(HMMSEARCH.out.tblout)
 
     FILTER_HITS(ch_filter_in, params.filter_evalue, params.min_bitscore)
-    // FILTER_HITS.out.faa  : [ sample, hits.faa ]
-    // FILTER_HITS.out.hits : [ sample, hits.tsv ]
 
     // pair each sample's hits with its own contigs -> [ sample, hits.faa, contigs.fa ]
     ch_extract_in = FILTER_HITS.out.faa.join(ch_sample_ctgs)
 
     EXTRACT_GENES(ch_extract_in)
-    // EXTRACT_GENES.out.fna    : [ sample, hits.fna ]
-    // EXTRACT_GENES.out.coords : [ sample, coords.tsv ]
 
     // =========================================================================
     // 3. Gather all samples -> pool hits -> dereplicate
@@ -178,8 +183,7 @@ workflow {
         .collectFile(name: 'all_samples_hmm_hits.tsv', keepHeader: true, sort: true)
 
     // =========================================================================
-    // 4. Abundance of the catalogue genes in every sample
-    //    (needs reads -> only when starting from --input_sample_table)
+    // 4. Abundance of the catalogue genes in every sample (needs reads)
     // =========================================================================
     ch_rep_genes   = channel.empty()
     ch_map_logs    = channel.empty()
@@ -191,8 +195,7 @@ workflow {
         EXTRACT_REP_GENES(DEREPLICATION.out.kept_ids, POOL_GENES.out.faa)
         ch_rep_genes = EXTRACT_REP_GENES.out.fna                       // [ batch, rep_genes.fna ]
 
-        // ONE index for all samples. Every input upstream is a single-value channel,
-        // so the index is a value channel too and is reused by every mapping task.
+        // ONE index for all samples (single-value channel, reused by every mapping task)
         BOWTIE2_BUILD(ch_rep_genes)                                    // [ batch, bowtie2_index/ ]
 
         // map every sample's trimmed reads against the same index, in parallel
@@ -209,7 +212,7 @@ workflow {
     }
 
     publish:
-    trimmed        = ch_trimmed_reads
+    trimmed        = ch_trimmed_output
     fastp_reports  = ch_fastp_reports
     contigs        = ch_contigs_out
     assembly_logs  = ch_assembly_logs
