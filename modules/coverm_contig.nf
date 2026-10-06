@@ -4,7 +4,7 @@ process COVERM_CONTIG {
     memory '16 GB'
 
     conda 'bioconda::coverm=0.7.0'
-    container 'quay.io/biocontainers/coverm:0.7.0--TAG'   // TODO: replace TAG, see README / quay.io/biocontainers/coverm tags
+    container 'quay.io/biocontainers/coverm:0.7.0--hcb7b614_4'
 
     input:
     path(bams, stageAs: 'bams/*')    // sorted BAMs of ALL samples, named <sample>.bam
