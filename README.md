@@ -2,14 +2,14 @@
 
 A Nextflow pipeline that builds a **non-redundant gene catalogue of target enzymes** from metagenomic samples.
 
-Starting from paired-end reads, it trims and assembles each sample, predicts genes, pools the proteins and contigs of all samples, screens the proteins against user-provided HMM profiles, extracts the annotated proteins together with their gene sequences, and dereplicates them into a non-redundant set.
+Each sample is processed **independently and in parallel**: reads are trimmed and assembled, genes are predicted, and the proteins are screened against user-provided HMM profiles. Only the proteins that pass the scoring filters, together with their gene sequences, are then pooled across samples and dereplicated into a non-redundant catalogue.
 
-If you already have assemblies and predicted proteins (e.g. from a previous Geomosaic or MEGAHIT/Prodigal run), you can skip the read-based steps and start directly from them.
+If you already have assemblies and Prodigal predictions (e.g. from a previous Geomosaic run), you can skip the read-based steps and start directly from them.
 
 ## Workflow
 
 ```
- reads samplesheet (sample, r1, r2)
+ reads samplesheet (sample, r1, r2) Table A
         │
         ▼
  PREPROCESSING ──► fastp: adapter / quality trimming
@@ -20,20 +20,37 @@ If you already have assemblies and predicted proteins (e.g. from a previous Geom
         ▼
  ORF_PREDICTION ──► Prodigal (metagenomic mode)
         │
-        │   ◄── or start here with an ORF samplesheet (sample, orfs, contigs)
+        │   ◄── or start here with a protein/contig samplesheet (sample, orfs, contigs) Table B
         ▼
- POOL_ORFS / POOL_ASSEMBLIES ──► one protein and one contig file, IDs prefixed with the sample name
+ HMMSEARCH ──► all HMM profiles, fixed database size (-Z) for comparable E-values
         │
-        ├──► HMMSEARCH ──► one search per HMM profile
-        │        │
-        │        ▼
-        │   FILTER_PROTEINS ──► annotated ORFs passing --filter_evalue
-        │        │
-        │        ▼
-        │   EXTRACT_GENES ──► nucleotide sequence of each annotated gene
+        ▼
+ FILTER_HITS ──► E-value + bit score, best profile per ORF
         │
-        └──► DEREPLICATION ──► non-redundant gene catalogue (MMseqs2)
+        ▼
+ EXTRACT_GENES ──► nucleotide sequence of each hit, from the sample's own contigs
+        │
+        ▼
+ POOL_HITS / POOL_GENES ──► hits of all samples, IDs prefixed with the sample name
+        │
+        ▼
+ DEREPLICATION ──► non-redundant gene catalogue (MMseqs2)
+
 ```
+
+| # | Step | Tool | Output | Runs |
+|---|---|---|---|---|
+| 1 | Trimming | fastp | trimmed R1 / R2, report | per sample |
+| 2 | Assembly | MEGAHIT or metaSPAdes | contigs | per sample |
+| 3 | Contig filtering & renaming | SeqKit | filtered contigs `contig_N` + name mapping | per sample |
+| 4 | Gene prediction | Prodigal | proteins (`contig_N_M`) | per sample |
+| 5 | Profile search | HMMER `hmmsearch` | hits table | per sample |
+| 6 | Hit filtering | — | proteins passing E-value and bit score, best profile per ORF | per sample |
+| 7 | Gene extraction | SeqKit | nucleotide sequences + coordinates of the hits | per sample |
+| 8 | Pooling | — | one protein and one gene file, IDs prefixed with the sample name | once |
+| 9 | Dereplication | MMseqs2 | non-redundant gene catalogue | once |
+
+Starting from existing Prodigal output (entry point B) skips steps 1–4.
 
 ### Tools
 
@@ -81,7 +98,7 @@ nextflow run EdoT99/nf-gene-catalogue -r main -profile test,docker
 
 ## Input
 
-The pipeline has two entry points. Use **one** of them.
+The pipeline has two entry points. Use **exactly one** of them; the pipeline stops if neither or both are given.
 
 ### A. From reads (`--input_sample_table`)
 
@@ -121,32 +138,44 @@ SAMPLE_B,/data/SAMPLE_B/prodigal/orf_predicted.faa,/data/SAMPLE_B/megahit/geomos
 
 ### Contig and protein names
 
-After assembly, contigs are filtered by length and renamed `contig_1`, `contig_2`, … (the same convention as [Geomosaic](https://github.com/giovannellilab/Geomosaic)); a mapping to the original assembler headers is saved for each sample. When pooling, the sample name is prepended to every contig **and** protein ID:
+After assembly, contigs are filtered by length and renamed `contig_1`, `contig_2`, … (the same convention as [Geomosaic](https://github.com/giovannellilab/Geomosaic)); a mapping to the original assembler headers is saved for each sample. Prodigal names each protein after its contig plus a gene number (`contig_12_3` = gene 3 on `contig_12`).
+
+During per-sample processing IDs stay as they are. When the hits are pooled, the sample name is prepended so IDs from different samples never collide:
 
 ```
-contig:   >contig_12      →  >SAMPLE_A_contig_12
-protein:  >contig_12_3    →  >SAMPLE_A_contig_12_3   (gene 3 on that contig)
+protein:  >contig_12_3   →  >SAMPLE_A_contig_12_3
+gene:     >contig_12_3   →  >SAMPLE_A_contig_12_3
 ```
 
-Every hit can therefore be traced back to its sample and contig.
+Every catalogue entry can therefore be traced back to its sample, contig and gene.
 
 ### HMM profiles (`--hmm_db`)
 
-A folder containing one or more profile files ending in `.hmm`. Defaults to the profiles shipped in `assets/hmm_db/`. The pipeline stops with an error if no profiles are found.
+A folder containing one or more profile files ending in `.hmm`. Defaults to the profiles shipped in `assets/hmm_db/`. All profiles are searched together in one `hmmsearch` per sample. The pipeline stops with an error if no profiles are found.
+
+## Hit scoring
+
+Each sample's proteins are filtered in three steps:
+
+1. **E-value** ≤ `--filter_evalue` (full-sequence E-value)
+2. **Bit score** ≥ `--min_bitscore`
+3. **Best profile per ORF:** if an ORF matches several profiles, only the highest-scoring one is kept.
+
+> **Why a fixed database size (`--hmm_z`)?** An HMMER E-value depends on how many sequences were searched. Because each sample is searched separately, a larger sample would otherwise get larger E-values than a smaller one for the very same hit. The pipeline therefore gives every search the same database size (`hmmsearch -Z`): by default the total number of ORFs over all samples, so E-values behave as if all samples had been searched together. Bit scores do not depend on database size and are directly comparable between samples.
 
 ## Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
 | `--input_sample_table` | – | Reads samplesheet (`sample,r1,r2`). Entry point A. |
-| `--input_orf_table` | – | Assembly/protein samplesheet (`sample,orfs,contigs`). Entry point B. |
+| `--input_orf_table` | – | Protein/contig samplesheet (`sample,orfs,contigs`). Entry point B. |
 | `--assembler` | `megahit` | `megahit` or `metaspades`. metaSPAdes needs considerably more memory. |
 | `--hmm_db` | `assets/hmm_db` | Folder with `.hmm` profiles. |
-| `--hmm_evalue` | `1e-5` | E-value reporting threshold for `hmmsearch`. |
-| `--filter_evalue` | `1e-10` | Stricter E-value used to keep hits when filtering. |
+| `--hmm_evalue` | `1e-5` | Loose reporting threshold inside `hmmsearch`. |
+| `--hmm_z` | total ORFs | Database size used for E-values in every sample. Set it to skip counting ORFs on large datasets. |
+| `--filter_evalue` | `1e-10` | E-value cutoff for keeping a hit. |
+| `--min_bitscore` | `30` | Bit-score cutoff for keeping a hit. |
 | `--batch` | `batch01` | Name used for the gene catalogue outputs. |
-| `--pooled_faa` | – | Existing pooled protein FASTA. Skips protein pooling. |
-| `--pooled_contigs` | – | Existing pooled contig FASTA. Skips contig pooling. |
 
 Parameters can be given on the command line or collected in a YAML file:
 
@@ -156,6 +185,7 @@ input_sample_table: samplesheet.csv
 assembler: megahit
 hmm_db: /data/hmm_profiles
 filter_evalue: 1e-10
+min_bitscore: 30
 batch: batch01
 ```
 
@@ -201,25 +231,18 @@ nextflow run EdoT99/nf-gene-catalogue -r main -profile docker \
     --hmm_db /path/to/hmm_profiles
 ```
 
-### From existing pooled files
-
-```bash
-nextflow run EdoT99/nf-gene-catalogue -r main -profile docker \
-    --pooled_faa /path/to/pooled_orf_predicted.faa \
-    --pooled_contigs /path/to/pooled_contigs.fa \
-    --hmm_db /path/to/hmm_profiles
-```
-
-> **Important:** pooled files must use the same naming as the pipeline (see [Contig and protein names](#contig-and-protein-names)): removing the last `_<number>` from a protein ID must give the exact ID of its contig. If a contig cannot be found, `EXTRACT_GENES` stops with an error reporting how many genes were expected and how many were extracted. The safest option is to reuse the `pooled_orfs/` and `pooled_contigs/` files of a previous run.
-
 ### Resuming
 
-Add `-resume` to reuse steps that already finished. For example, to try a different filtering threshold without rerunning assembly or HMMER:
+Add `-resume` to reuse steps that already finished. Because every sample is processed separately, this also works when samples are added: only the new ones are assembled and annotated.
+
+Changing a scoring threshold reruns only the filtering and the steps after it, not assembly or HMMER:
 
 ```bash
 nextflow run EdoT99/nf-gene-catalogue -r main -profile docker -params-file params.yaml \
-    --filter_evalue 1e-20 -resume
+    --min_bitscore 50 -resume
 ```
+
+> Adding samples changes the default `--hmm_z` (total ORFs), which reruns `HMMSEARCH` for every sample. Set `--hmm_z` to a fixed value if you plan to add samples over time.
 
 ## Profiles
 
@@ -237,7 +260,7 @@ Without a "where" profile, tasks run on the local machine.
 
 ## Running on an HPC
 
-With the Slurm profile, Nextflow itself only coordinates: each task is submitted as its own Slurm job with the CPUs, memory and time set for that step, and runs in its own container or conda environment.
+With the Slurm profile, Nextflow itself only coordinates: each task (one step of one sample) is submitted as its own Slurm job with the CPUs, memory and time set for that step, and runs in its own container or conda environment.
 
 **1. Keep Nextflow running for the whole pipeline**, either in `tmux`/`screen` on the login node or as a small Slurm job:
 
@@ -276,27 +299,29 @@ Results are written to `results/` (change it with `-output-dir`):
 
 ```
 results/
-├── preprocessing/fastp/<sample>/      trimmed reads, fastp HTML/JSON reports
-├── assembly/<assembler>/<sample>/
-│   ├── <sample>.final_contigs.fa          filtered contigs, renamed contig_N
-│   ├── <sample>.contig_mapping.tsv        original header ⇥ new name
-│   └── <sample>.<assembler>.log           assembler log
-├── prodigal/<sample>/                 predicted proteins (.faa), genes (.fna), GFF
-├── pooled_orfs/                       pooled_orf_predicted.faa
-├── pooled_contigs/                    pooled_contigs.fa
-├── hmmsearch/                         <profile>.tblout / .domtblout / .out, one set per profile
-├── hmm_filtered/
-│   ├── hmm_hits.tsv                   all ORF–profile hits passing --filter_evalue
-│   ├── hmm_best_hits.tsv              best (lowest E-value) profile per ORF
-│   ├── hmm_hits.faa                   protein sequences of the annotated ORFs
-│   ├── hmm_hits.fna                   gene (nucleotide) sequences, same IDs
-│   └── hmm_hits_coords.tsv            contig, start, end, strand, ORF ID (1-based)
+├── preprocessing/fastp/<sample>/          trimmed reads, fastp HTML/JSON reports          ┐
+├── assembly/<assembler>/<sample>/                                                         │
+│   ├── <sample>.final_contigs.fa              filtered contigs, renamed contig_N          │
+│   ├── <sample>.contig_mapping.tsv            original header ⇥ new name                  │  one folder
+│   └── <sample>.<assembler>.log               assembler log                               │  per sample
+├── hmm_annotation/<sample>/                                                               │
+│   ├── <sample>.tblout                        raw hmmsearch hits                          │
+│   ├── <sample>.hmm_hits.tsv                  hits passing E-value + bit score, best per ORF
+│   ├── <sample>.hits.faa                      protein sequences of the hits               │
+│   ├── <sample>.hits.fna                      gene (nucleotide) sequences, same IDs       │
+│   └── <sample>.hits_coords.tsv               contig, start, end, strand, ORF ID          ┘
+├── hmm_annotation/all_samples_hmm_hits.tsv    filtered hits of all samples in one table
+├── pooled_hits/
+│   ├── proteins/                              hit proteins of all samples, IDs SAMPLE_contig_N_M
+│   └── genes/                                 hit genes of all samples, same IDs
 └── gene_catalog/<batch>/
-    ├── <batch>_rep_seq.fasta          non-redundant representative sequences
-    ├── <batch>_cluster.tsv            representative ⇥ member mapping
-    ├── <batch>_all_seqs.fasta         all sequences grouped by cluster
-    └── <batch>_kept_ids.txt           IDs of the representatives
+    ├── <batch>_rep_seq.fasta                  non-redundant representative sequences
+    ├── <batch>_cluster.tsv                    representative ⇥ member mapping
+    ├── <batch>_all_seqs.fasta                 all sequences grouped by cluster
+    └── <batch>_kept_ids.txt                   IDs of the representatives
 ```
+
+`preprocessing/` and `assembly/` are only produced when starting from reads (entry point A).
 
 ## Citations
 
