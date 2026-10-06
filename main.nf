@@ -66,6 +66,9 @@ workflow {
                   "Found: ${header.join(', ')}. Expected: ${required_cols.join(', ')}."
         }
     }
+    if( !(params.preprocessing in ['fastp', 'none']) ) {
+        problems << "--preprocessing: '${params.preprocessing}' is not valid. Must be 'fastp' or 'none'."
+    }
     if( !(params.assembler in ['megahit', 'metaspades']) ) {
         error "Wrong assembler specified: ${params.assembler}. Must be either 'megahit' or 'metaspades'."
     }
@@ -92,10 +95,16 @@ workflow {
             .fromPath(params.input_sample_table)
             .splitCsv(header: true)
             .map { row -> [ row.sample, file(row.r1, checkIfExists: true), file(row.r2, checkIfExists: true) ] }
-
-        PREPROCESSING(ch_fastq_pairs, params.preprocessing)
-        ch_trimmed_reads = PREPROCESSING.out.trimmed_reads          // [ sample, R1, R2 ]
-        ch_fastp_reports = PREPROCESSING.out.reports
+        
+        if( params.preprocessing == 'none' ) {
+            // reads are already trimmed: use them as they are
+            ch_trimmed_reads = ch_fastq_pairs
+        }
+        else {
+            PREPROCESSING(ch_fastq_pairs, params.preprocessing)
+            ch_trimmed_reads = PREPROCESSING.out.trimmed_reads
+            ch_fastp_reports = PREPROCESSING.out.reports
+        }
 
         ASSEMBLY(ch_trimmed_reads, params.assembler)
         ch_contigs_out   = ASSEMBLY.out.contigs                     // [ sample, tool, contigs ]  (for publishing)
