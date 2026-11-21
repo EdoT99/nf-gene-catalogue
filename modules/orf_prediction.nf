@@ -16,8 +16,9 @@ process ORF_PREDICTION {
 
     script:
     def args = task.ext.args ?: '-p meta'
+    def cat  = contigs.name.endsWith('.gz') ? "gzip -cd ${contigs}" : "cat ${contigs}"
     """
-    gzip -cdf ${contigs} | prodigal \\
+    ${cat} | prodigal \\
         -a ${sample}.faa \\
         -d ${sample}.fna \\
         -o ${sample}.gff \\

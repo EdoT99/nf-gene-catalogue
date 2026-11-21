@@ -1,6 +1,6 @@
 process EXTRACT_REP_GENES {
     tag "${batch}"
-    cpus 1
+    cpus 2
     memory '4 GB'
 
     conda 'bioconda::seqkit=2.9.0'
@@ -15,7 +15,14 @@ process EXTRACT_REP_GENES {
 
     script:
     """
-    seqkit grep -f ${kept_ids} ${pooled_genes} > ${batch}_rep_genes.fna
+    export GOMAXPROCS=${task.cpus}      # seqkit (Go): threads = CPUs of this job
+
+    if [ ! -s ${kept_ids} ]; then
+        echo "ERROR: the catalogue is empty - no protein passed the HMM filters in any sample" >&2
+        exit 1
+    fi
+
+    seqkit grep -j ${task.cpus} -f ${kept_ids} ${pooled_genes} > ${batch}_rep_genes.fna
 
     # every representative protein must have its gene sequence
     expected=\$(grep -c . ${kept_ids} || true)

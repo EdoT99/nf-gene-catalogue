@@ -29,7 +29,9 @@ If you already have assemblies and Prodigal predictions (e.g. from a previous Ge
         │
         ▼
  EXTRACT_GENES ──► nucleotide sequence of each hit, from the sample's own contigs
-        |
+        │
+════════╪══════════ everything above runs per sample, in parallel ══════════
+        │
         ▼
  POOL_HITS / POOL_GENES ──► hits of all samples, IDs prefixed with the sample name
         │
@@ -40,7 +42,7 @@ If you already have assemblies and Prodigal predictions (e.g. from a previous Ge
  EXTRACT_REP_GENES ──► nucleotide sequences of the catalogue genes
         │
         ▼
- BOWTIE2_BUILD ──► indexing the gene-catalogue reference
+ BOWTIE2_BUILD ──► one index for all samples
         │
         ▼
  BOWTIE2_ALIGN ──► trimmed reads of each sample vs the same index (per sample, in parallel)
@@ -66,6 +68,12 @@ If you already have assemblies and Prodigal predictions (e.g. from a previous Ge
 
 Starting from existing Prodigal output (entry point B) skips steps 2–4. Steps 1 and 10–12 need reads, so they run whenever a reads samplesheet is given, including together with entry point B.
 
+### Why per sample?
+
+- **Parallel:** on a cluster every sample runs as its own job; total runtime is close to that of the largest sample.
+- **Resumable:** adding a sample or rerunning a failed one only reprocesses that sample.
+- **Small data downstream:** only the annotated proteins (typically a tiny fraction of all ORFs) are pooled and clustered, and gene extraction uses each sample's own assembly, so no multi-GB pooled assembly is needed.
+
 ### Tools
 
 | Step | Tool |
@@ -83,7 +91,7 @@ All tools are pulled automatically as containers (Docker / Singularity) or conda
 
 ## Requirements
 
-**1. Nextflow** (≥ 25.10, requires Java 17+)
+**1. Nextflow** (≥ 26.04, requires Java 17+). Older versions fail on the optional parameters.
 
 ```bash
 conda create -n nextflow -c conda-forge -c bioconda nextflow
@@ -104,12 +112,13 @@ If Docker is not installed, follow the [official installation guide](https://doc
 sudo usermod -aG docker $USER   # then log out and back in
 ```
 
-## Quick start: test run
+## Quick start
 
-Run the pipeline on the bundled mock dataset to check your setup:
+A bundled test dataset is not available yet. To check your setup, run case B (below) on one or two samples with `-stub`, which runs every step with empty placeholder files in seconds and verifies the wiring, inputs and containers settings:
 
 ```bash
-nextflow run EdoT99/nf-gene-catalogue -r main -profile test,docker
+nextflow run EdoT99/nf-gene-catalogue -r main -profile docker -stub \
+    --input_orf_table orf_samplesheet.csv --hmm_db /path/to/hmm_profiles
 ```
 
 ## Input
@@ -121,6 +130,7 @@ The pipeline accepts two samplesheets. Give **at least one**; they can also be c
 | reads only (`--input_sample_table`) | full pipeline: trimming, assembly, Prodigal, annotation, catalogue, abundance |
 | proteins/contigs only (`--input_orf_table`) | annotation and catalogue; no abundance (no reads to map) |
 | both | trimming, annotation of the existing proteins, catalogue, abundance; assembly and Prodigal are skipped |
+| reads + existing catalogue (`--reference`) | **abundance only**: trimming (unless `--preprocessing none`), mapping and CoverM against the given catalogue; everything else is skipped |
 
 When both are given, sample names must be identical in the two samplesheets, as each sample's reads are mapped and reported under that name.
 
@@ -150,8 +160,8 @@ If assembly and gene prediction were already done, skip trimming, assembly and P
 
 ```csv
 sample,orfs,contigs
-SAMPLE_A,/data/SAMPLE_A/prodigal/orf_predicted.faa,/data/SAMPLE_A/megahit/geomosaic_contigs.fasta
-SAMPLE_B,/data/SAMPLE_B/prodigal/orf_predicted.faa,/data/SAMPLE_B/megahit/geomosaic_contigs.fasta
+SAMPLE_A,/data/SAMPLE_A/prodigal/protein_translations.faa,/data/SAMPLE_A/megahit/geomosaic_contigs.fasta
+SAMPLE_B,/data/SAMPLE_B/prodigal/protein_translations.faa,/data/SAMPLE_B/megahit/geomosaic_contigs.fasta
 ```
 
 | Column | Content |
@@ -159,8 +169,16 @@ SAMPLE_B,/data/SAMPLE_B/prodigal/orf_predicted.faa,/data/SAMPLE_B/megahit/geomos
 | `sample` | Unique sample name, no spaces |
 | `orfs` | Protein FASTA predicted by **Prodigal** (`.faa`) |
 | `contigs` | The assembly the proteins were predicted from (plain or `.gz`) |
+| `orf_map` | *Optional.* Table with the coordinates of every ORF, for proteins whose headers no longer carry Prodigal's coordinates (e.g. Geomosaic's `prodigal/orf_contig_mapping.tsv`: columns `orf_id, contig, leftmost_coord, rightmost_coord, strand`, tab-separated, with header) |
 
-> **Note:** gene sequences are extracted using the coordinates stored in Prodigal's protein headers (`>ID # start # end # strand # ...`). The `orfs` files must therefore be unmodified Prodigal output, predicted from the `contigs` file in the same row.
+> **Note:** gene sequences are cut from the contigs using each ORF's coordinates. They are taken from the `orf_map` table if given, otherwise from Prodigal's protein headers (`>ID # start # end # strand # ...`). Either way, the proteins must have been predicted from the `contigs` file in the same row.
+>
+> **Geomosaic output:** use `prodigal/protein_translations.faa`, Prodigal's original file with coordinates in the headers (as in the example above). Geomosaic's `orf_predicted.faa` has renamed proteins (`contig_12_orf_3`) without coordinates; if you use it, add the `orf_map` column:
+>
+> ```csv
+> sample,orfs,contigs,orf_map
+> SAMPLE_A,/data/SAMPLE_A/prodigal/orf_predicted.faa,/data/SAMPLE_A/megahit/geomosaic_contigs.fasta,/data/SAMPLE_A/prodigal/orf_contig_mapping.tsv
+> ```
 
 ### Contig and protein names
 
@@ -177,7 +195,7 @@ Every catalogue entry can therefore be traced back to its sample, contig and gen
 
 ### HMM profiles (`--hmm_db`)
 
-A folder containing one or more profile files ending in `.hmm`. Defaults to the profiles shipped in `assets/hmm_db/`. All profiles are searched together in one `hmmsearch` per sample. The pipeline stops with an error if no profiles are found.
+A folder containing one or more profile files ending in `.hmm`. The default is `assets/hmm_db/` inside the pipeline folder; the profiles are **not** shipped with the repository, so either copy yours there or pass `--hmm_db /path/to/profiles`. All profiles are searched together in one `hmmsearch` per sample. The pipeline stops with an error if no profiles are found.
 
 ## Hit scoring
 
@@ -203,7 +221,7 @@ All samples are mapped against **the same reference**: the nucleotide sequences 
 
 Only reliable alignments are counted (`--min-read-percent-identity 95`, `--min-read-aligned-percent 50`). With a reference made only of target genes, reads from related non-target genes would otherwise be counted too. Coverage at the gene ends is corrected for, as read pairs only partly overlap short genes there.
 
-Mapping can be turned off with `--skip_abundance`.
+Mapping can be turned off with `--skip_abundance`: the pipeline then ends once the dereplicated catalogue is built, and `results/` contains everything up to `gene_catalog/`. Rerunning later without the option and with `-resume` adds the abundance step without repeating the earlier ones.
 
 ## Parameters
 
@@ -211,6 +229,8 @@ Mapping can be turned off with `--skip_abundance`.
 |---|---|---|
 | `--input_sample_table` | – | Reads samplesheet (`sample,r1,r2`). Entry point A; also enables abundance. |
 | `--input_orf_table` | – | Protein/contig samplesheet (`sample,orfs,contigs`). Entry point B; skips assembly and Prodigal. |
+| `--reference` | – | Existing nucleotide catalogue (e.g. `gene_catalog/<batch>/<batch>_rep_genes.fna`). Runs **only** the abundance step; requires `--input_sample_table`. |
+| `--preprocessing` | `fastp` | `fastp`, or `none` if the reads in the samplesheet are already trimmed. |
 | `--assembler` | `megahit` | `megahit` or `metaspades`. metaSPAdes needs considerably more memory. |
 | `--hmm_db` | `assets/hmm_db` | Folder with `.hmm` profiles. |
 | `--hmm_evalue` | `1e-5` | Loose reporting threshold inside `hmmsearch`. |
@@ -218,8 +238,7 @@ Mapping can be turned off with `--skip_abundance`.
 | `--filter_evalue` | `1e-10` | E-value cutoff for keeping a hit. |
 | `--min_bitscore` | `30` | Bit-score cutoff for keeping a hit. |
 | `--batch` | `batch01` | Name used for the gene catalogue outputs. |
-| `--skip_abundance` | `false` | Skip read mapping and CoverM. |
-| `--save_mapping` | `true` | Copy the Bowtie2 index and BAM files to `results/mapping/`. |
+| `--skip_abundance` | `false` | Stop after the dereplicated catalogue: no read mapping, no CoverM. Results up to `gene_catalog/` are still published. |
 
 Parameters can be given on the command line or collected in a YAML file:
 
@@ -260,33 +279,88 @@ nextflow run EdoT99/nf-gene-catalogue -r main -profile docker -params-file param
 
 ## Usage
 
-### From reads
+Pick the case that matches what you already have. All commands use Docker; on an HPC replace `-profile docker` with e.g. `-profile univ_hpc,singularity` (see [Running on an HPC](#running-on-an-hpc)).
+
+| Case | You have | Runs | Main results |
+|---|---|---|---|
+| **A** | raw reads only | everything: fastp → assembly → Prodigal → HMMER → catalogue → abundance | `assembly/`, `hmm_annotation/`, `gene_catalog/`, `abundance/` |
+| **B** | Prodigal proteins + contigs (no reads) | HMMER → catalogue | `hmm_annotation/`, `gene_catalog/` |
+| **C** | trimmed reads + an existing catalogue | read mapping → abundance only | `abundance/` |
+
+### Case A: end-to-end, from raw reads
+
+No assemblies yet. The pipeline trims, assembles, predicts genes, annotates, builds the catalogue and measures abundance.
+
+`samplesheet.csv`:
+
+```csv
+sample,r1,r2
+SAMPLE_A,/data/raw/SAMPLE_A_R1.fastq.gz,/data/raw/SAMPLE_A_R2.fastq.gz
+SAMPLE_B,/data/raw/SAMPLE_B_R1.fastq.gz,/data/raw/SAMPLE_B_R2.fastq.gz
+```
 
 ```bash
 nextflow run EdoT99/nf-gene-catalogue -r main -profile docker \
     --input_sample_table samplesheet.csv \
     --assembler megahit \
-    --hmm_db /path/to/hmm_profiles
+    --hmm_db /path/to/hmm_profiles \
+    --batch project01
 ```
 
-### From existing assemblies and proteins
+Add `--skip_abundance` to stop once the catalogue is built.
+
+### Case B: from existing proteins and contigs, no reads
+
+Assembly and Prodigal were already run (e.g. with Geomosaic). The pipeline annotates the proteins and builds the catalogue. Without reads there is no abundance step.
+
+`orf_samplesheet.csv`:
+
+```csv
+sample,orfs,contigs
+SAMPLE_A,/data/SAMPLE_A/prodigal/protein_translations.faa,/data/SAMPLE_A/megahit/geomosaic_contigs.fasta
+SAMPLE_B,/data/SAMPLE_B/prodigal/protein_translations.faa,/data/SAMPLE_B/megahit/geomosaic_contigs.fasta
+```
 
 ```bash
 nextflow run EdoT99/nf-gene-catalogue -r main -profile docker \
     --input_orf_table orf_samplesheet.csv \
-    --hmm_db /path/to/hmm_profiles
+    --hmm_db /path/to/hmm_profiles \
+    --batch project01
 ```
 
-### Existing proteins + reads for abundance
+The catalogue genes are written to `results/gene_catalog/project01/project01_rep_genes.fna`: this file is the `--reference` for case C.
 
-Skips assembly and Prodigal but still maps the reads to the catalogue:
+> To get abundance in the same run, also give the reads with `--input_sample_table` (add `--preprocessing none` if they are already trimmed). Assembly and Prodigal are still skipped.
+
+### Case C: abundance only, against an existing catalogue
+
+The catalogue was built before (case A or B) and the reads are already trimmed. Only read mapping and CoverM run, so this can be repeated on different clusters with different sets of samples, all against the same catalogue.
+
+`trimmed_samplesheet.csv`:
+
+```csv
+sample,r1,r2
+SAMPLE_C,/data/SAMPLE_C/fastp/R1.fastq.gz,/data/SAMPLE_C/fastp/R2.fastq.gz
+SAMPLE_D,/data/SAMPLE_D/fastp/R1.fastq.gz,/data/SAMPLE_D/fastp/R2.fastq.gz
+```
 
 ```bash
 nextflow run EdoT99/nf-gene-catalogue -r main -profile docker \
-    --input_orf_table orf_samplesheet.csv \
-    --input_sample_table samplesheet.csv \
-    --hmm_db /path/to/hmm_profiles
+    --input_sample_table trimmed_samplesheet.csv \
+    --preprocessing none \
+    --reference /path/to/project01_rep_genes.fna \
+    --batch project01_setC
 ```
+
+`--reference` can also be set once in a config file (`params.reference = '/path/to/project01_rep_genes.fna'`) instead of on the command line.
+
+> **Build the catalogue from all samples first.** Genes that occur only in samples left out of the catalogue are missing from the reference, and their reads either do not map or inflate related genes.
+>
+> Use a new `--batch` name per run and unique sample names across runs: each run writes `abundance/<batch>/<batch>_abundance.tsv`, and tables from different runs share the same gene IDs, so they can be joined on the first column:
+>
+> ```bash
+> csvtk join -t -f 1 abundance/project01_setC/*_abundance.tsv abundance/project01_setD/*_abundance.tsv > all_abundance.tsv
+> ```
 
 ### Resuming
 
@@ -377,15 +451,12 @@ results/
 │   ├── <batch>_all_seqs.fasta                 all sequences grouped by cluster
 │   ├── <batch>_kept_ids.txt                   IDs of the representatives
 │   └── <batch>_rep_genes.fna                  nucleotide sequences of the representatives (mapping reference)
-├── mapping/                                   (only with --save_mapping, the default)
-│   ├── bowtie2_index/<batch>.*.bt2            Bowtie2 index of the catalogue genes
-│   ├── bams/<sample>.bam                      reads of each sample mapped to the catalogue, sorted
-│   └── logs/<sample>.bowtie2.log              alignment rate of each sample
-└── abundance/
-    └── <batch>_abundance.tsv                  catalogue gene × sample: count, trimmed_mean, TPM
+└── abundance/<batch>/
+    ├── <batch>_abundance.tsv                  catalogue gene × sample: count, trimmed_mean, TPM
+    └── mapping_logs/<sample>.bowtie2.log      alignment rate of each sample
 ```
 
-`preprocessing/`, `mapping/` and `abundance/` are produced whenever reads are given; `assembly/` only when the pipeline assembles (reads without `--input_orf_table`). BAM files can be large: run with `--save_mapping false` to keep them (and the index) only in Nextflow's `work/` directory; the mapping logs are always saved.
+`preprocessing/` (only with fastp) and `abundance/` are produced whenever reads are given; `assembly/` only when the pipeline assembles (reads without `--input_orf_table`). With `--reference`, only `abundance/<batch>/` is produced. BAM files and the Bowtie2 index stay in Nextflow's `work/` directory.
 
 ## Citations
 

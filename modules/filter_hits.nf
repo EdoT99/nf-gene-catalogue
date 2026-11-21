@@ -1,6 +1,6 @@
 process FILTER_HITS {
     tag "${sample}"
-    cpus 1
+    cpus 2
     memory '4 GB'
 
     conda 'bioconda::seqkit=2.9.0'
@@ -17,13 +17,15 @@ process FILTER_HITS {
 
     script:
     """
+    export GOMAXPROCS=${task.cpus}      # seqkit (Go): threads = CPUs of this job
+
     # tblout columns: 1 = ORF id, 3 = profile, 5 = full-seq E-value, 6 = full-seq bit score
     # 1. both cutoffs  2. sort by ORF, then bit score (highest first)  3. keep the best profile per ORF
     printf "sample\\torf_id\\tcontig_id\\tprofile\\tevalue\\tbitscore\\n" > ${sample}.hmm_hits.tsv
     grep -v '^#' ${tblout} \\
         | awk -v e=${evalue} -v b=${min_bitscore} -v s=${sample} 'BEGIN{OFS="\\t"}
               NF >= 6 && (\$5+0) <= (e+0) && (\$6+0) >= (b+0) {
-                  contig = \$1; sub(/_[0-9]+\$/, "", contig)
+                  contig = \$1; sub(/(_orf)?_[0-9]+\$/, "", contig)   # contig_12_3 or contig_12_orf_3 -> contig_12
                   print s, \$1, contig, \$3, \$5, \$6
               }' \\
         | sort -t \$'\\t' -k2,2 -k6,6gr \\
@@ -32,7 +34,11 @@ process FILTER_HITS {
 
     # 4. protein sequences of the kept ORFs (empty file if a sample has no hits)
     tail -n +2 ${sample}.hmm_hits.tsv | cut -f2 > hit_ids.txt
-    seqkit grep -f hit_ids.txt ${proteins} > ${sample}.hits.faa
+    if [ -s hit_ids.txt ]; then
+        seqkit grep -j ${task.cpus} -f hit_ids.txt ${proteins} > ${sample}.hits.faa
+    else
+        : > ${sample}.hits.faa
+    fi
     """
 
     stub:

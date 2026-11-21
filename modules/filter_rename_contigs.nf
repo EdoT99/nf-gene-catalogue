@@ -16,6 +16,8 @@ process FILTER_RENAME_CONTIGS {
     script:
     def args = task.ext.args ?: '-m 1000'              // seqkit seq options; default: keep contigs >= 1000 bp
     """
+    export GOMAXPROCS=${task.cpus}      # seqkit (Go): threads = CPUs of this job
+
     # 1. Length filter (as Geomosaic: seqkit seq with user options)
     seqkit seq ${args} -j ${task.cpus} ${contigs} > filtered.fa
 

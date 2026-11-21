@@ -19,6 +19,11 @@ process DEREPLICATION {
     script:
     def args = task.ext.args ?: '--min-seq-id 0.95 -c 0.9 --cov-mode 1'
     """
+    if ! grep -q '^>' ${pooled_faa}; then
+        echo "ERROR: no protein passed the HMM filters in any sample - nothing to dereplicate" >&2
+        exit 1
+    fi
+
     mmseqs easy-linclust \\
         ${pooled_faa} \\
         ${batch} \\

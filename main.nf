@@ -16,7 +16,8 @@ include { ABUNDANCE                } from './subworkflows/abundance.nf'     // B
 params {
     // ---- inputs ----
     input_sample_table: Path?   = null      // CSV: sample,r1,r2         reads (assembly and/or abundance)
-    input_orf_table:    Path?   = null      // CSV: sample,orfs,contigs  existing Prodigal output (skips assembly)
+    input_orf_table:    Path?   = null      // CSV: sample,orfs,contigs[,orf_map]  existing Prodigal output (skips assembly)
+                                            //   orf_map (optional): ORF table with coordinates, e.g. Geomosaic orf_contig_mapping.tsv
     reference:          Path?   = null      // existing nucleotide catalogue (rep_genes.fna):
                                             //   ONLY the abundance step runs (needs --input_sample_table)
 
@@ -158,13 +159,19 @@ workflow {
     }
     else {
         // =====================================================================
-        // 1b. ONE per-sample channel: [ sample, orfs.faa, contigs.fa ]
+        // 1b. ONE per-sample channel: [ sample, orfs.faa, contigs.fa, orf_map | [] ]
+        //     orf_map = [] -> gene coordinates are read from Prodigal's protein headers
         // =====================================================================
         if( params.input_orf_table ) {
             ch_samples = channel
                 .fromPath(params.input_orf_table, checkIfExists: true)
                 .splitCsv(header: true)
-                .map { row -> [ row.sample, file(row.orfs, checkIfExists: true), file(row.contigs, checkIfExists: true) ] }
+                .map { row ->
+                    [ row.sample,
+                      file(row.orfs, checkIfExists: true),
+                      file(row.contigs, checkIfExists: true),
+                      row.orf_map ? file(row.orf_map, checkIfExists: true) : [] ]
+                }
         }
         else {
             ASSEMBLY(ch_trimmed_reads, params.assembler)
@@ -176,10 +183,11 @@ workflow {
 
             ORF_PREDICTION(ch_contigs)                              // emits faa: [ sample, orfs.faa ]
             ch_samples = ORF_PREDICTION.out.faa.join(ch_contigs)    // [ sample, orfs.faa, contigs.fa ]
+                .map { sample, faa, contigs -> [ sample, faa, contigs, [] ] }   // Prodigal headers carry coordinates
         }
 
-        ch_orfs        = ch_samples.map { sample, faa, contigs -> [ sample, faa ] }       // [ sample, orfs.faa ]
-        ch_sample_ctgs = ch_samples.map { sample, faa, contigs -> [ sample, contigs ] }   // [ sample, contigs.fa ]
+        ch_orfs        = ch_samples.map { sample, faa, contigs, orf_map -> [ sample, faa ] }              // [ sample, orfs.faa ]
+        ch_sample_ctgs = ch_samples.map { sample, faa, contigs, orf_map -> [ sample, contigs, orf_map ] } // [ sample, contigs.fa, orf_map ]
 
         // =====================================================================
         // 2. Per-sample HMM annotation (runs in parallel, one task per sample)
@@ -195,7 +203,7 @@ workflow {
 
         FILTER_HITS(ch_orfs.join(HMMSEARCH.out.tblout), params.filter_evalue, params.min_bitscore)
 
-        EXTRACT_GENES(FILTER_HITS.out.faa.join(ch_sample_ctgs))     // [ sample, hits.faa, contigs.fa ]
+        EXTRACT_GENES(FILTER_HITS.out.faa.join(ch_sample_ctgs))     // [ sample, hits.faa, contigs.fa, orf_map ]
 
         // =====================================================================
         // 3. Gather all samples -> pool hits -> dereplicate

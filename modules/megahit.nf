@@ -11,7 +11,7 @@ process MEGAHIT {
     tuple val(sample), path(read1), path(read2)       // trimmed paired-end reads
 
     output:
-    tuple val(sample), path("${sample}.contigs.faa"),  emit: contigs
+    tuple val(sample), path("${sample}.contigs.fa"),  emit: contigs
     tuple val(sample), path("${sample}.megahit.log"), emit: log
 
     script:
@@ -27,7 +27,7 @@ process MEGAHIT {
         ${args}
 
     # common output name, whichever assembler ran
-    mv megahit_out/${sample}.contigs.faa ${sample}.contigs.faa
+    mv megahit_out/${sample}.contigs.fa ${sample}.contigs.fa
     cp megahit_out/${sample}.log        ${sample}.megahit.log
     """
 
