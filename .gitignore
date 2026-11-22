@@ -4,4 +4,5 @@ results/
 .nextflow.log*
 null/
 !assets/*.csv
-assets/hmm_db/*
+assets/hmm_db/**.log
+slurm_logs/
